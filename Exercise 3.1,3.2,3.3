@@ -1023,3 +1023,128 @@ def user_risk_analysis(user_id) -> float:
         risk_score += 0.5
 
     return float(min(risk_score, 5.0))
+
+
+
+    #task 3.3
+def recommend(user_id, filter_following):
+    """
+    Returns up to 5 recommended posts (reverse-chronological).
+    Signals:
+      - positive reactions by the user (like/love/laugh/wow)
+      - authors the user follows
+      - DIY topic boost (content contains 'diy', or seed users/posts from the brief)
+    """
+    POSITIVE = ('like', 'love', 'laugh', 'wow')
+
+    if not user_id:
+        return query_db("""
+            SELECT p.id, p.content, p.created_at, u.username, u.id AS user_id
+            FROM posts p JOIN users u ON p.user_id = u.id
+            ORDER BY p.created_at DESC
+            LIMIT 5
+        """)
+
+    seed_usernames = ('starboy99','DancingDolphin','blogger_bob')
+    seed_posts = (1810, 1875, 1880, 2113)
+
+    seed_rows = query_db(
+        f"SELECT id FROM posts WHERE id IN ({','.join(['?']*len(seed_posts))})",
+        seed_posts
+    ) if seed_posts else []
+    seed_post_ids = {r['id'] for r in (seed_rows or [])}
+
+    seed_user_rows = query_db(
+        f"SELECT id FROM users WHERE username IN ({','.join(['?']*len(seed_usernames))})",
+        seed_usernames
+    )
+    seed_author_ids = {r['id'] for r in (seed_user_rows or [])}
+
+    followed = query_db("SELECT followed_id AS aid FROM follows WHERE follower_id = ?", (user_id,))
+    followed_ids = {r['aid'] for r in (followed or [])}
+
+    liked_authors = query_db(f"""
+        SELECT DISTINCT p.user_id AS aid
+        FROM reactions r
+        JOIN posts p ON p.id = r.post_id
+        WHERE r.user_id = ? AND r.reaction_type IN ({",".join(["?"]*len(POSITIVE))})
+    """, (user_id, *POSITIVE)) or []
+    liked_author_ids = {r['aid'] for r in liked_authors}
+
+    candidate_authors = followed_ids if filter_following else (followed_ids | liked_author_ids | seed_author_ids)
+
+    if not candidate_authors:
+        return query_db("""
+            SELECT p.id, p.content, p.created_at, u.username, u.id AS user_id
+            FROM posts p
+            JOIN users u ON p.user_id = u.id
+            LEFT JOIN (
+                SELECT post_id, COUNT(*) AS cpos
+                FROM reactions
+                WHERE reaction_type IN ('like','love','laugh','wow')
+                GROUP BY post_id
+            ) pr ON pr.post_id = p.id
+            WHERE p.user_id != ?
+            ORDER BY p.created_at DESC, IFNULL(pr.cpos,0) DESC
+            LIMIT 5
+        """, (user_id,))
+
+    author_list = list(candidate_authors)
+    placeholders = ",".join(["?"] * len(author_list))
+
+    base = query_db(f"""
+        SELECT p.id, p.content, p.created_at, u.username, u.id AS user_id
+        FROM posts p
+        JOIN users u ON p.user_id = u.id
+        WHERE p.user_id IN ({placeholders})
+          AND p.user_id != ?
+          AND p.id NOT IN (SELECT post_id FROM reactions WHERE user_id = ?)
+        ORDER BY p.created_at DESC
+        LIMIT 200
+    """, (*author_list, user_id, user_id)) or []
+
+    scored = []
+    for r in base:
+        s = 0
+        aid = r['user_id']
+        pid = r['id']
+        text = (r['content'] or "").lower()
+
+        if aid in followed_ids:      s += 2
+        if aid in liked_author_ids:  s += 3
+        if 'diy' in text:            s += 3
+        if pid in seed_post_ids:     s += 2
+        if aid in seed_author_ids:   s += 2
+
+        scored.append((s, r['created_at'], r))
+
+    scored.sort(key=lambda x: (x[0], x[1]), reverse=True)
+    recs = [r for _,__,r in scored][:5]
+
+    if len(recs) < 5:
+        need = 5 - len(recs)
+        seen = {r['id'] for r in recs}
+        backfill = query_db(f"""
+            SELECT p.id, p.content, p.created_at, u.username, u.id AS user_id
+            FROM posts p
+            JOIN users u ON p.user_id = u.id
+            LEFT JOIN (
+                SELECT post_id, COUNT(*) AS cpos
+                FROM reactions
+                WHERE reaction_type IN ('like','love','laugh','wow')
+                GROUP BY post_id
+            ) pr ON pr.post_id = p.id
+            WHERE p.user_id != ?
+              AND p.id NOT IN (SELECT post_id FROM reactions WHERE user_id = ?)
+              {("AND p.user_id IN (" + placeholders + ")") if filter_following else ""}
+            ORDER BY p.created_at DESC, IFNULL(pr.cpos,0) DESC
+            LIMIT {need}
+        """, (user_id, user_id, *author_list) if filter_following else (user_id, user_id,))
+        for r in (backfill or []):
+            if r['id'] not in seen:
+                recs.append(r); seen.add(r['id'])
+    return recs[:5]
+
+if __name__ == '__main__':
+    app.run(debug=True, port=8080)
+
